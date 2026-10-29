@@ -1,3 +1,4 @@
+use super::super::fallback::type3_base;
 use super::grouping::{across, is_centred, row_rect};
 use super::{
     BlockStyle, CraftFont, Dict, Document, EditError, HashMap, LineEdit, MAX_TYPE3_GLYPHS, Matrix, Metrics, Object, Op, PdfString, Pieces,
@@ -13,14 +14,14 @@ const MAX_STYLED_FALLBACK_BATCHES: usize = 64;
 
 struct FallbackGroup {
     face: &'static CraftFont,
-    seen: std::collections::HashSet<char>,
+    seen: std::collections::HashSet<String>,
     glyphs: Vec<Type3Glyph>,
-    positions: Vec<usize>,
+    positions: Vec<(std::ops::Range<usize>, String)>,
 }
 
 struct FallbackBuilder {
     groups: Vec<FallbackGroup>,
-    names: std::collections::BTreeMap<(String, bool, char), usize>,
+    names: std::collections::BTreeMap<(String, bool, String), usize>,
     glyphs: usize,
     per_font: usize,
     budget: usize,
@@ -131,7 +132,11 @@ impl CharacterPreparation<'_> {
         for (range, index) in spans {
             let source = lines.get(index).unwrap_or(first);
             let start = range.start;
-            for (offset, ch) in draft.get(range).unwrap_or_default().char_indices() {
+            for (offset, text) in crate::bidi::variation_units(draft.get(range).unwrap_or_default()) {
+                let Some(ch) = text.chars().next() else { continue };
+                if matches!(ch, '\n' | '\r') && text.chars().count() > 1 {
+                    return Err(EditError::Invalid("a variation selector cannot follow a line break".into()));
+                }
                 if ch == '\n' {
                     chars.push((ch, index, source.font.clone()));
                     continue;
@@ -141,23 +146,22 @@ impl CharacterPreparation<'_> {
                     chars.push((if crlf { '\r' } else { '\n' }, index, source.font.clone()));
                     continue;
                 }
-                let text = ch.to_string();
                 let requested = overrides.get(&index).and_then(|range| range.resource.as_deref()).or(style.resource.as_deref());
-                let name = if let Some(name) = resolver.encodable_font(source, &text, requested)? {
+                let name = if let Some(name) = resolver.encodable_font(source, text, requested)? {
                     name
-                } else if needs_type3(&text) {
-                    fallback.prepare(source, ch, &text, chars.len())?
+                } else if needs_type3(text) {
+                    fallback.prepare(source, text, chars.len())?
                 } else {
                     let name = resolver.substitute_font(source);
                     substituted = Some(source_family(&source.base_font).base_font(source.bold, source.italic).to_owned());
                     name
                 };
-                chars.push((ch, index, name));
+                chars.extend(text.chars().map(|ch| (ch, index, name.clone())));
             }
         }
         drop(resolver);
         for group in fallback.groups {
-            let written = write_type3_glyphs(doc, fonts, group.face, false, group.glyphs, fallback.per_font);
+            let written = write_type3_glyphs(doc, fonts, group.face, false, group.glyphs, fallback.per_font)?;
             for name in &written.names {
                 let font = fonts
                     .get(name.as_bytes())
@@ -165,10 +169,13 @@ impl CharacterPreparation<'_> {
                     .ok_or_else(|| EditError::Invalid("the fallback font could not be loaded".into()))?;
                 metrics.insert(name.clone(), Metrics::from_dict(doc, &font));
             }
-            for position in group.positions {
-                let item = chars.get_mut(position).ok_or_else(|| EditError::Invalid("the fallback character is missing".into()))?;
-                let (font, _) = written.codes.get(&item.0).ok_or_else(|| EditError::Invalid("the fallback glyph is missing".into()))?;
-                item.2 = written.names.get(*font).cloned().ok_or_else(|| EditError::Invalid("the fallback font is missing".into()))?;
+            for (positions, text) in group.positions {
+                let (font, _) = written.codes.get(&text).ok_or_else(|| EditError::Invalid("the fallback glyph is missing".into()))?;
+                let name = written.names.get(*font).ok_or_else(|| EditError::Invalid("the fallback font is missing".into()))?;
+                for position in positions {
+                    let item = chars.get_mut(position).ok_or_else(|| EditError::Invalid("the fallback character is missing".into()))?;
+                    item.2 = name.clone();
+                }
             }
             substituted = Some(written.family.to_owned());
         }
@@ -188,8 +195,9 @@ impl FallbackBuilder {
         }
     }
 
-    fn prepare(&mut self, source: &TextLine, ch: char, text: &str, position: usize) -> Result<String, EditError> {
-        let key = (source.base_font.clone(), source.bold, ch);
+    fn prepare(&mut self, source: &TextLine, text: &str, position: usize) -> Result<String, EditError> {
+        let ch = type3_base(text)?;
+        let key = (source.base_font.clone(), source.bold, text.to_owned());
         let group_index = if let Some(index) = self.names.get(&key) {
             *index
         } else {
@@ -204,20 +212,19 @@ impl FallbackBuilder {
             index
         };
         let group = self.groups.get_mut(group_index).ok_or_else(|| EditError::Invalid("the fallback face is missing".into()))?;
-        if group.seen.insert(ch) {
-            if self.glyphs >= self.budget {
+        if group.seen.insert(text.to_owned()) {
+            let cost = 1 + usize::from(text.chars().count() > 1);
+            if self.glyphs.saturating_add(cost) > self.budget {
                 return Err(EditError::Invalid(format!(
                     "the replacement needs more than {} fallback glyphs; edit a smaller paragraph or load a complete font",
                     self.budget
                 )));
             }
             let (path, width) = type3_glyph(group.face, ch)?.ok_or_else(|| no_glyph_for(group.face, ch))?;
-            let code = u8::try_from((group.glyphs.len() % self.per_font).saturating_add(1))
-                .map_err(|_| EditError::Invalid("replacement text has too many unique characters".into()))?;
-            group.glyphs.push(Type3Glyph { code, ch, path, width });
-            self.glyphs = self.glyphs.saturating_add(1);
+            group.glyphs.push(Type3Glyph { text: text.to_owned(), path, width });
+            self.glyphs = self.glyphs.saturating_add(cost);
         }
-        group.positions.push(position);
+        group.positions.push((position..position.saturating_add(text.chars().count()), text.to_owned()));
         Ok(String::new())
     }
 }
@@ -244,7 +251,7 @@ fn prepare_shaped_rows(
     fonts: &Dict,
     rows: &[Vec<StyledChar>],
     kept: &[bool],
-    advance: impl Fn(&StyledChar) -> f64,
+    advance: impl Fn(&StyledChar, &str) -> f64,
 ) -> Result<ShapedRows, EditError> {
     let mut runs = HashMap::new();
     let mut advances = HashMap::new();
@@ -256,8 +263,8 @@ fn prepare_shaped_rows(
                 end += 1;
             }
             let segment = row.get(at..end).unwrap_or_default();
-            advances.insert((row_index, at), segment.iter().map(&advance).sum::<f64>());
             let text: String = segment.iter().map(|character| character.0).collect();
+            advances.insert((row_index, at), advance(item, &text));
             if let Some((bytes, shaped, family)) = shape_source(doc, fonts, &item.2, &text)? {
                 runs.insert((row_index, at), (bytes, shaped, family));
             }
@@ -332,6 +339,13 @@ fn validated_ranges<'a>(draft: &str, style: &'a BlockStyle) -> Result<Vec<&'a Ra
     });
     if ranges.len() > 1024 || invalid_range || ranges.windows(2).any(|pair| pair[0].range.end > pair[1].range.start) {
         return Err(EditError::Invalid("text style ranges must be disjoint UTF-8 boundaries with finite formatting (at most 1024 ranges)".into()));
+    }
+    for range in &ranges {
+        for edge in [range.range.start, range.range.end] {
+            if draft.get(edge..).and_then(|rest| rest.chars().next()).is_some_and(crate::bidi::is_variation_selector) {
+                return Err(EditError::Invalid("a text style range cannot split a base character from its variation selectors".into()));
+            }
+        }
     }
     Ok(ranges)
 }
@@ -429,10 +443,14 @@ fn wrap_styled_rows(
         let mut end = at + 1;
         if !item.0.is_whitespace() {
             // A word ends at a space, or where Chinese or Japanese text may break between characters.
-            while let (Some(before), Some(current)) = (chars.get(end - 1), chars.get(end))
+            let mut before = item.0;
+            while let Some(current) = chars.get(end)
                 && !current.0.is_whitespace()
-                && !crate::linebreak::between(before.0, current.0)
+                && !crate::linebreak::between(before, current.0)
             {
+                if !crate::bidi::is_variation_selector(current.0) {
+                    before = current.0;
+                }
                 end += 1;
             }
         }
@@ -713,12 +731,12 @@ pub(crate) fn rewrite_styled_block(
         w
     };
     let calibration = calibration_factors(lines, &metrics, style, &overrides, space_of);
-    let advance = |item: &(char, usize, String)| -> f64 {
+    let advance = |item: &(char, usize, String), text: &str| -> f64 {
         let source = lines.get(item.1).unwrap_or(first);
         let Some(m) = metrics.get(&item.2) else { return 0.0 };
         source_width(
             m,
-            &item.0.to_string(),
+            text,
             size_of(source, item.1),
             space_of(&item.2, m),
             overrides
@@ -756,7 +774,7 @@ pub(crate) fn rewrite_styled_block(
                     * scale
                     * source.origin.k;
             } else {
-                width += segment.iter().map(&advance).sum::<f64>();
+                width += advance(item, &string);
             }
             at = end;
         }

@@ -1648,6 +1648,336 @@ fn uzbek_and_kazakh_cyrillic_use_the_bundled_latin_face() {
     }
 }
 
+#[test]
+fn variation_line_and_block_roundtrip_keep_plain_and_selected_bases() {
+    for replacement in ["1\u{FE0F}", "1 1\u{FE0F} 1\u{FE0E}", "1\u{FE0F}\u{FE0E}"] {
+        for paragraph in [false, true] {
+            let mut doc = text_page("BT /F2 12 Tf 72 700 Td (ab) Tj ET BT /F1 12 Tf 72 400 Td (Untouched) Tj ET");
+            let untouched = text::text_lines(&doc, 0).unwrap()[1].clone();
+            let edit = if paragraph { text::replace_block(&mut doc, 0, 0, replacement) } else { text::replace_line(&mut doc, 0, 0, replacement) };
+            assert!(edit.is_ok(), "{replacement:?}: {edit:?}");
+            let mut reopened = reopen(&doc);
+            let lines = text::text_lines(&reopened, 0).unwrap();
+            assert_eq!(lines[0].text, replacement);
+            assert_eq!((lines[1].text.as_str(), lines[1].rect), (untouched.text.as_str(), untouched.rect));
+            let twice = format!("{replacement} 1\u{FE0F}");
+            if paragraph { text::replace_block(&mut reopened, 0, 0, &twice) } else { text::replace_line(&mut reopened, 0, 0, &twice) }.unwrap();
+            assert_eq!(text::text_lines(&reopen(&reopened), 0).unwrap()[0].text, twice);
+        }
+    }
+}
+
+#[test]
+fn variation_tracking_and_centering_follow_drawn_codes() {
+    for spacing in [0.0, 2.0] {
+        let mut plain = text_page("BT /F2 12 Tf 72 700 Td (ab) Tj ET");
+        let mut selected = plain.clone();
+        let style = text::BlockStyle { width: Some(55.0), align: Some(added::Align::Center), char_spacing: Some(spacing), ..Default::default() };
+        text::rewrite_block(&mut plain, 0, 0, Some("1қ 1қ 1қ 1қ"), &style).unwrap();
+        text::rewrite_block(&mut selected, 0, 0, Some("1\u{FE0F}қ 1қ 1\u{FE0E}қ 1қ"), &style).unwrap();
+        let a = text::text_lines(&reopen(&plain), 0).unwrap();
+        let b = text::text_lines(&reopen(&selected), 0).unwrap();
+        assert_eq!(a.len(), b.len());
+        for (a, b) in a.iter().zip(&b) {
+            assert_eq!(a.text, b.text.replace(['\u{FE0E}', '\u{FE0F}'], ""));
+            assert!(close(a.rect, b.rect), "Tc={spacing}: {:?} versus {:?}", a.rect, b.rect);
+            assert_eq!(a.ink.len(), b.ink.len());
+        }
+    }
+}
+
+#[test]
+fn variation_type3_code_32_is_reserved_for_unicode_space() {
+    for replacement in ["қABCDEFGHIJKLMNOPQRSTUVWXYZ012345", "қ A B", "A\u{FE0F}A B\u{FE0E}B қ"] {
+        let mut a = text_page("BT /F2 12 Tf 0 Tw 72 700 Td (ab) Tj ET");
+        let mut b = text_page("BT /F2 12 Tf 10 Tw 72 700 Td (ab) Tj ET");
+        text::replace_line(&mut a, 0, 0, replacement).unwrap();
+        text::replace_line(&mut b, 0, 0, replacement).unwrap();
+        let a = text::text_lines(&reopen(&a), 0).unwrap();
+        let b = text::text_lines(&reopen(&b), 0).unwrap();
+        let expected = replacement.matches(' ').count() as f64 * 10.0;
+        assert!(
+            (b[0].rect[2] - a[0].rect[2] - expected).abs() < 0.001,
+            "{replacement:?}: {:?} versus {:?}; expected {expected}",
+            a[0].rect,
+            b[0].rect
+        );
+    }
+}
+
+#[test]
+fn variation_partitioned_fonts_retain_nominal_aliases_after_reopen() {
+    let replacement = "1\u{FE0F}2\u{FE0E}3\u{FE0F}";
+    for paragraph in [false, true] {
+        let mut doc = text_page("BT /F2 12 Tf 72 700 Td (ab) Tj ET");
+        if paragraph {
+            text::rewrite_block_with_limit(&mut doc, 0, 0, Some(replacement), &Default::default(), 2).unwrap();
+        } else {
+            text::replace_line_with_limit(&mut doc, 0, 0, replacement, 2).unwrap();
+        }
+        let mut reopened = reopen(&doc);
+        let before = text::text_lines(&reopened, 0).unwrap()[0].clone();
+        let page = pdfcraft_model::pages(&reopened).remove(0);
+        let resources = reopened.dict(page.dict.get(b"Resources").unwrap()).unwrap();
+        let fonts = reopened.dict(resources.get(b"Font").unwrap()).unwrap();
+        let mut count = 0;
+        for (_, font) in fonts.iter() {
+            let font = reopened.resolve(font);
+            let Some(font) = font.as_dict().filter(|font| font.name(b"Subtype") == Some(b"Type3")) else { continue };
+            count += 1;
+            let procs = reopened.dict(font.get(b"CharProcs").unwrap()).unwrap();
+            assert!(procs.len() <= 2);
+            assert_eq!(
+                procs.iter().filter_map(|(_, proc)| proc.as_ref()).collect::<std::collections::HashSet<_>>().len(),
+                1,
+                "the nominal alias shares its glyph program"
+            );
+            let metrics = pdfcraft_fonts::pdf::Metrics::from_dict(&reopened, font);
+            for (sequence, base) in [("1\u{FE0F}", "1"), ("2\u{FE0E}", "2"), ("3\u{FE0F}", "3")] {
+                if metrics.encode(sequence).is_some() {
+                    let alias = metrics.encode(base).expect("the nominal alias is in the same font");
+                    assert_eq!(metrics.decode(&alias), base);
+                }
+            }
+        }
+        assert_eq!(count, 3);
+        if paragraph { text::replace_block(&mut reopened, 0, 0, "123") } else { text::replace_line(&mut reopened, 0, 0, "123") }.unwrap();
+        let after = text::text_lines(&reopen(&reopened), 0).unwrap()[0].clone();
+        assert_eq!(after.text, "123");
+        assert_eq!(after.base_font, before.base_font);
+        assert!(close(after.rect, before.rect), "{:?} versus {:?}", after.rect, before.rect);
+    }
+}
+
+fn assert_variation_units_share_glyph_program(replacement: &str, paragraph: bool) {
+    let mut doc = text_page("BT /F2 12 Tf 72 700 Td (ab) Tj ET");
+    if paragraph { text::replace_block(&mut doc, 0, 0, replacement) } else { text::replace_line(&mut doc, 0, 0, replacement) }.unwrap();
+    let reopened = reopen(&doc);
+    assert_eq!(text::text_lines(&reopened, 0).unwrap()[0].text, replacement);
+    let page = pdfcraft_model::pages(&reopened).remove(0);
+    let resources = reopened.dict(page.dict.get(b"Resources").unwrap()).unwrap();
+    let fonts = reopened.dict(resources.get(b"Font").unwrap()).unwrap();
+    let mut checked = 0;
+    for (_, font) in fonts.iter() {
+        let font = reopened.resolve(font);
+        let Some(font) = font.as_dict().filter(|font| font.name(b"Subtype") == Some(b"Type3")) else { continue };
+        let metrics = pdfcraft_fonts::pdf::Metrics::from_dict(&reopened, font);
+        let units: Vec<_> = ["1", "1\u{FE0F}", "1\u{FE0E}"].into_iter().filter(|unit| metrics.encode(unit).is_some()).collect();
+        assert!(units.len() >= 2);
+        let encoding = reopened.dict(font.get(b"Encoding").unwrap()).unwrap();
+        let differences = encoding.get(b"Differences").unwrap().as_array().unwrap();
+        let mut names = std::collections::HashMap::new();
+        let mut code = 0;
+        for entry in differences {
+            match entry {
+                Object::Int(value) => code = *value,
+                Object::Name(name) => {
+                    names.insert(code as u8, name);
+                    code += 1;
+                }
+                _ => panic!("unexpected Differences entry: {entry:?}"),
+            }
+        }
+        let procs = reopened.dict(font.get(b"CharProcs").unwrap()).unwrap();
+        let mut codes = std::collections::HashSet::new();
+        let mut refs = std::collections::HashSet::new();
+        for unit in units {
+            let encoded = metrics.encode(unit).unwrap();
+            assert_eq!(encoded.len(), 1);
+            assert_eq!(metrics.decode(&encoded), unit);
+            assert!(codes.insert(encoded[0]), "each Unicode unit has its own code");
+            refs.insert(procs.get(names[&encoded[0]]).unwrap().as_ref().unwrap());
+        }
+        assert_eq!(refs.len(), 1, "plain and selected versions of 1 share one glyph program");
+        checked += 1;
+    }
+    assert_eq!(checked, 1);
+}
+
+#[test]
+fn variation_plain_then_selected_share_line_glyph_program() {
+    assert_variation_units_share_glyph_program("1 1\u{FE0F}", false);
+}
+
+#[test]
+fn variation_plain_then_selected_share_block_glyph_program() {
+    assert_variation_units_share_glyph_program("1 1\u{FE0F}", true);
+}
+
+#[test]
+fn variation_selected_versions_share_line_glyph_program() {
+    assert_variation_units_share_glyph_program("1\u{FE0F}1\u{FE0E}", false);
+}
+
+#[test]
+fn variation_selected_versions_share_block_glyph_program() {
+    assert_variation_units_share_glyph_program("1\u{FE0F}1\u{FE0E}", true);
+}
+
+#[test]
+fn variation_multiline_and_whole_sequence_style_keep_text() {
+    for replacement in ["1\u{FE0F}\n1\u{FE0E}", "1\u{FE0F}1\u{FE0E}"] {
+        let mut doc = text_page("BT /F2 12 Tf 72 700 Td (ab) Tj ET");
+        let style = text::BlockStyle {
+            ranges: vec![text::RangeStyle {
+                range: 0..4,
+                family: None,
+                resource: None,
+                size: None,
+                color: Some([1.0, 0.0, 0.0]),
+                underline: None,
+                char_spacing: None,
+                scale: None,
+            }],
+            ..Default::default()
+        };
+        text::rewrite_block(&mut doc, 0, 0, Some(replacement), &style).unwrap();
+        let lines = text::text_lines(&reopen(&doc), 0).unwrap();
+        assert_eq!(lines.iter().map(|line| line.text.as_str()).collect::<String>(), replacement.replace('\n', ""));
+    }
+}
+
+#[test]
+fn variation_refusals_preserve_every_saved_byte() {
+    let oversized = format!("1{}", "\u{FE0F}".repeat(256));
+    for replacement in ["\u{FE0F}", "1 \u{FE0F}", oversized.as_str()] {
+        for paragraph in [false, true] {
+            let mut doc = text_page("BT /F2 12 Tf 72 700 Td (ab) Tj ET");
+            let before = write_incremental(&doc, &SaveOptions::default()).unwrap();
+            let result = if paragraph { text::replace_block(&mut doc, 0, 0, replacement) } else { text::replace_line(&mut doc, 0, 0, replacement) };
+            assert!(result.is_err());
+            assert_eq!(write_incremental(&doc, &SaveOptions::default()).unwrap(), before);
+        }
+    }
+    let mut doc = text_page("BT /F2 12 Tf 72 700 Td (ab) Tj ET");
+    text::replace_line(&mut doc, 0, 0, "1\u{FE0F}").unwrap();
+    let mut doc = reopen(&doc);
+    let before = write_incremental(&doc, &SaveOptions::default()).unwrap();
+    let split = text::BlockStyle {
+        ranges: vec![text::RangeStyle {
+            range: 0..1,
+            family: None,
+            resource: None,
+            size: None,
+            color: Some([1.0, 0.0, 0.0]),
+            underline: None,
+            char_spacing: None,
+            scale: None,
+        }],
+        ..Default::default()
+    };
+    assert!(text::rewrite_block(&mut doc, 0, 0, None, &split).is_err());
+    assert_eq!(write_incremental(&doc, &SaveOptions::default()).unwrap(), before);
+    assert!(text::replace_block(&mut doc, 0, 0, "1\u{FE0F}Z\u{10FFFF}").is_err());
+    assert_eq!(write_incremental(&doc, &SaveOptions::default()).unwrap(), before);
+    let mut doc = text_page("BT /F2 12 Tf 72 700 Td (ab) Tj ET");
+    let before = write_incremental(&doc, &SaveOptions::default()).unwrap();
+    assert!(text::replace_line_with_limit(&mut doc, 0, 0, "1\u{FE0F}", 1).is_err());
+    assert_eq!(write_incremental(&doc, &SaveOptions::default()).unwrap(), before);
+}
+
+#[test]
+fn variation_destination_limit_and_existing_noop_remain_valid() {
+    let replacement = format!("1{}", "\u{FE0F}".repeat(255));
+    let mut doc = text_page("BT /F2 12 Tf 72 700 Td (ab) Tj ET");
+    text::replace_line(&mut doc, 0, 0, &replacement).unwrap();
+    assert_eq!(text::text_lines(&reopen(&doc), 0).unwrap()[0].text, replacement);
+    let mut doc = text_page("BT /F1 12 Tf 72 700 Td /Span <</ActualText <FEFF0031FE0F>>> BDC (1) Tj EMC /F1 14 Tf ( tail) Tj ET");
+    let before = write_incremental(&doc, &SaveOptions::default()).unwrap();
+    text::rewrite_block(&mut doc, 0, 0, None, &Default::default()).unwrap();
+    assert_eq!(write_incremental(&doc, &SaveOptions::default()).unwrap(), before);
+}
+
+#[test]
+fn variation_cjk_and_arrow_use_available_official_faces() {
+    if pdfcraft_fonts::document_japanese_font().is_none() {
+        return;
+    }
+    for replacement in ["\u{27A1}\u{FE0F}", "字\u{FE0F}字\u{FE0E}字"] {
+        let mut doc = text_page("BT /F2 12 Tf 72 700 Td (ab) Tj ET");
+        text::rewrite_block(&mut doc, 0, 0, Some(replacement), &text::BlockStyle { width: Some(15.0), ..Default::default() }).unwrap();
+        let lines = text::text_lines(&reopen(&doc), 0).unwrap();
+        assert_eq!(lines.iter().map(|line| line.text.as_str()).collect::<String>(), replacement);
+    }
+}
+
+#[test]
+fn variation_existing_cid_resource_preserves_zero_width_selector_codes() {
+    let mut doc = text_page("BT /F2 12 Tf 72 700 Td <0001> Tj ET");
+    let cmap = b"1 begincodespacerange <0000> <FFFF> endcodespacerange 3 beginbfchar <0001> <0031> <0002> <FE0F> <0003> <0041> endbfchar";
+    let cmap = doc.add(Object::Stream(pdfcraft_cos::Stream::from_raw(Dict::new(), cmap.to_vec())));
+    let mut cid = Dict::new();
+    cid.set(b"Subtype".to_vec(), Object::name("CIDFontType2"));
+    cid.set(b"DW".to_vec(), Object::Int(500));
+    cid.set(b"W".to_vec(), Object::Array(vec![Object::Int(1), Object::Array(vec![Object::Int(500), Object::Int(0), Object::Int(500)])]));
+    let cid = doc.add(Object::Dict(cid));
+    let mut font = Dict::new();
+    font.set(b"Type".to_vec(), Object::name("Font"));
+    font.set(b"Subtype".to_vec(), Object::name("Type0"));
+    font.set(b"BaseFont".to_vec(), Object::name("SyntheticCID"));
+    font.set(b"Encoding".to_vec(), Object::name("Identity-H"));
+    font.set(b"DescendantFonts".to_vec(), Object::Array(vec![Object::Ref(cid)]));
+    font.set(b"ToUnicode".to_vec(), Object::Ref(cmap));
+    doc.set(pdfcraft_cos::ObjRef::new(6, 0), Object::Dict(font));
+    text::rewrite_block(&mut doc, 0, 0, Some("1\u{FE0F}\nA"), &text::BlockStyle { resource: Some("F2".into()), ..Default::default() }).unwrap();
+    let reopened = reopen(&doc);
+    assert_eq!(text::text_lines(&reopened, 0).unwrap().iter().map(|line| line.text.as_str()).collect::<String>(), "1\u{FE0F}A");
+    assert!(String::from_utf8_lossy(&page_content_bytes(&reopened, 0)).contains("F2"));
+}
+
+#[test]
+fn variation_original_sequence_cmap_keeps_source_font_and_placement() {
+    for paragraph in [false, true] {
+        let mut doc = text_page("BT /F2 12 Tf 2 Tc 72 700 Td (a) Tj ET");
+        let cmap = b"1 begincodespacerange <00> <FF> endcodespacerange 2 beginbfchar <61> <0031FE0F> <62> <0031FE0E> endbfchar";
+        let cmap = doc.add(Object::Stream(pdfcraft_cos::Stream::from_raw(Dict::new(), cmap.to_vec())));
+        let reference = pdfcraft_cos::ObjRef::new(6, 0);
+        let mut font = doc.get(reference).as_dict().unwrap().clone();
+        font.set(b"ToUnicode".to_vec(), Object::Ref(cmap));
+        doc.set(reference, Object::Dict(font));
+        let mut doc = reopen(&doc);
+        let before = text::text_lines(&doc, 0).unwrap()[0].clone();
+        assert_eq!(before.text, "1\u{FE0F}", "the original PDF already carries the sequence");
+        let edit =
+            if paragraph { text::replace_block(&mut doc, 0, 0, &before.text) } else { text::replace_line(&mut doc, 0, 0, &before.text) }.unwrap();
+        assert!(edit.substituted.is_none());
+        let mut doc = reopen(&doc);
+        let after = text::text_lines(&doc, 0).unwrap()[0].clone();
+        assert_eq!(
+            (after.text.as_str(), after.font.as_str(), after.base_font.as_str(), after.rect),
+            (before.text.as_str(), before.font.as_str(), before.base_font.as_str(), before.rect)
+        );
+        let replacement = "1\u{FE0F}1\u{FE0E}";
+        let edit =
+            if paragraph { text::replace_block(&mut doc, 0, 0, replacement) } else { text::replace_line(&mut doc, 0, 0, replacement) }.unwrap();
+        assert!(edit.substituted.is_none());
+        let after = text::text_lines(&reopen(&doc), 0).unwrap()[0].clone();
+        assert_eq!(
+            (after.text.as_str(), after.font.as_str(), after.base_font.as_str()),
+            (replacement, before.font.as_str(), before.base_font.as_str())
+        );
+        assert_eq!((after.rect[0], after.baseline(), after.size), (before.rect[0], before.baseline(), before.size));
+    }
+}
+
+#[test]
+fn variation_rtl_style_refusal_and_shared_page_keep_saved_bytes() {
+    let mut doc = text_page("BT /F1 12 Tf 72 700 Td (source) Tj ET");
+    let before = write_incremental(&doc, &SaveOptions::default()).unwrap();
+    let style = text::BlockStyle { resource: Some("F1".into()), ..Default::default() };
+    let error = text::rewrite_block(&mut doc, 0, 0, Some("א1\u{FE0F}"), &style).unwrap_err();
+    assert!(error.to_string().contains("right-to-left"));
+    assert_eq!(write_incremental(&doc, &SaveOptions::default()).unwrap(), before);
+    let mut doc = fixture();
+    let streams_before = streams(&doc, 1);
+    let text_before = text::text_lines(&doc, 1).unwrap()[0].clone();
+    text::replace_line(&mut doc, 0, 0, "1\u{FE0F}").unwrap();
+    let reopened = reopen(&doc);
+    assert_eq!(streams(&reopened, 1), streams_before);
+    let text_after = text::text_lines(&reopened, 1).unwrap()[0].clone();
+    assert_eq!((text_after.text, text_after.rect), (text_before.text, text_before.rect));
+}
+
 /// The Japanese faces keep first refusal for the Cyrillic they do carry, so Russian text keeps the
 /// face it was drawn with before the bundled Latin face was added.
 #[test]
@@ -1809,7 +2139,8 @@ fn japanese_replacement_over_240_unique_glyphs_is_split_across_fallback_fonts() 
         let procs = reopened.resolve(font.get(b"CharProcs").unwrap());
         let count = procs.as_dict().unwrap().len();
         let last = font.get(b"LastChar").and_then(|o| o.as_int()).unwrap_or(i64::MAX);
-        assert!(count <= 240 && last <= 240, "{name:?}: {count} glyphs, LastChar {last}");
+        assert!(count <= 240 && (1..=255).contains(&last), "{name:?}: {count} glyphs, LastChar {last}");
+        assert!(pdfcraft_fonts::pdf::Metrics::from_dict(&reopened, font).encode(" ").is_none(), "no space was included in this font");
         glyphs += count;
     }
     assert_eq!(glyphs, 300);

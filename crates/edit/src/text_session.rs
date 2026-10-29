@@ -67,6 +67,9 @@ impl TextSession {
         if !self.is_current(doc) {
             return Err(EditError::Invalid("the paragraph changed while it was being edited".into()));
         }
-        rewrite_block_from(doc, self.page, self.lines.clone(), self.block, text, style, max_glyphs)
+        let mut staged = doc.clone();
+        let edit = rewrite_block_from(&mut staged, self.page, self.lines.clone(), self.block, text, style, max_glyphs)?;
+        *doc = staged;
+        Ok(edit)
     }
 }

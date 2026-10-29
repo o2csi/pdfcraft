@@ -46,8 +46,8 @@ fn fallback_names(face: &CraftFont, hebrew: bool) -> (&'static str, &'static str
 }
 
 /// Drops the generated fallback fonts ([`is_type3_fallback`]) that nothing on `page` shows any more.
-/// Each rewrite generates its own, with the outlines of every character it draws, so without this
-/// an earlier rewrite's fonts stay in the page's resources and the file. Only a font dictionary the
+/// Rewrites can generate new fonts while reusing existing glyphs. Drop resources no longer shown.
+/// Only a font dictionary the
 /// page owns is changed (a rewrite gives the page its own), and nothing is dropped unless every
 /// content stream that may name the page's fonts can be read: the page's own, and those of form
 /// XObjects and Type 3 glyphs that have no resources of their own and so use the page's.
@@ -184,27 +184,47 @@ pub(crate) fn source_family(base_font: &str) -> crate::added::Family {
 
 pub(crate) const MAX_TYPE3_GLYPHS: usize = 240;
 
-/// The generated fonts for one replacement: one per run of at most `max_glyphs` unique characters,
-/// in order of first appearance.
+/// Generated fonts and their Unicode sequences. Each font's code budget includes nominal aliases.
 #[derive(Clone)]
 pub(crate) struct Type3Fallback {
     /// The family its glyphs come from ("Shippori Mincho").
-    pub(crate) family: &'static str,
+    pub(crate) family: String,
     /// The fonts' resource names in order; the first is `PCJp` (`PCLat` for the bundled Latin
     /// face, `PCHe` for Hebrew text).
     pub(crate) names: Vec<String>,
-    /// Every unique character with its advance (em), in order of first appearance.
-    pub(super) widths: Vec<(char, f64)>,
-    /// Where each character is shown: the index of its font in `names`, and its code there.
-    pub(crate) codes: HashMap<char, (usize, u8)>,
+    /// Each Unicode unit with its nominal advance (em).
+    pub(super) widths: Vec<(String, f64)>,
+    /// Where each Unicode unit is shown: its font in `names`, and its code there.
+    pub(crate) codes: HashMap<String, (usize, u8)>,
 }
 
-/// One glyph of a generated font: its code there, its character, its glyph procedure and advance.
+/// One Unicode unit and the nominal outline drawn for it; codes are assigned by the writer.
 pub(crate) struct Type3Glyph {
-    pub(crate) code: u8,
-    pub(crate) ch: char,
+    pub(crate) text: String,
     pub(crate) path: Vec<u8>,
     pub(crate) width: f64,
+}
+
+struct EncodedType3Glyph {
+    code: u8,
+    text: String,
+    path: std::rc::Rc<Vec<u8>>,
+    width: f64,
+}
+
+/// Validate only a unit that needs a new nominal Type 3 glyph; complete source fonts take priority.
+pub(crate) fn type3_base(text: &str) -> Result<char, EditError> {
+    let base = text.chars().next().ok_or_else(|| EditError::Invalid("replacement text is empty".into()))?;
+    if crate::bidi::is_variation_selector(base) || (base.is_whitespace() && text.chars().count() > 1) {
+        return Err(EditError::Invalid("a variation selector must follow a non-whitespace base character".into()));
+    }
+    if text.encode_utf16().take(257).count() > 256 {
+        return Err(EditError::Invalid("a variation sequence cannot exceed 256 UTF-16 code units".into()));
+    }
+    if text.chars().skip(1).any(|ch| !crate::bidi::is_variation_selector(ch)) {
+        return Err(EditError::Invalid("one fallback glyph must contain one base and its BMP variation selectors".into()));
+    }
+    Ok(base)
 }
 
 fn pdf_num(v: f64) -> String {
@@ -259,10 +279,8 @@ fn proportional(ch: char, glyph: &pdfcraft_fonts::GlyphOutline) -> (f64, f64) {
     (SIDE_BEARING - glyph.bbox[0], ink + 2.0 * SIDE_BEARING)
 }
 
-fn unicode_hex(ch: char) -> String {
-    let mut units = [0u16; 2];
-    let encoded = ch.encode_utf16(&mut units);
-    encoded.iter().map(|u| format!("{u:04X}")).collect()
+fn unicode_hex(text: &str) -> String {
+    text.encode_utf16().map(|unit| format!("{unit:04X}")).collect()
 }
 
 /// The same outline for a face that may simply lack the glyph: `None` then, so the caller can try
@@ -363,17 +381,19 @@ pub(super) fn type3_font(
     max_glyphs: usize,
 ) -> Result<Type3Fallback, EditError> {
     let (faces, hebrew) = type3_faces(text, family, bold)?;
-    // Each unique character once, in order of first appearance.
-    let mut chars = Vec::new();
+    // Each unique Unicode unit once, in order of first appearance.
+    let mut units = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for ch in text.chars() {
-        if seen.insert(ch) {
-            chars.push(ch);
+    for (_, unit) in crate::bidi::variation_units(text) {
+        type3_base(unit)?;
+        if seen.insert(unit) {
+            units.push(unit);
         }
     }
-    if chars.is_empty() {
+    if units.is_empty() {
         return Err(EditError::Invalid("replacement text is empty".into()));
     }
+    let chars: Vec<char> = units.iter().map(|unit| type3_base(unit)).collect::<Result<_, _>>()?;
     // The faces differ in coverage (e.g. of Cyrillic), so use the best face that has every
     // character. When none has them all, the best face reports the character it lacks. Hebrew
     // text keeps the Hebrew face and takes each character it lacks from the next face that has it.
@@ -381,10 +401,11 @@ pub(super) fn type3_font(
         .ok_or_else(|| no_fallback_font(text))?;
     let others: &[&CraftFont] = if hebrew { faces.get(1..).unwrap_or_default() } else { &[] };
     // Every outline is read before the document is touched, so a character that fails leaves it
-    // as it was. Each font takes the next `per_font` characters; codes restart at 1 in each.
+    // as it was. The writer partitions units and their nominal aliases within the code budget.
     let per_font = max_glyphs.clamp(1, MAX_TYPE3_GLYPHS);
     let mut glyphs = Vec::with_capacity(chars.len());
-    for (i, ch) in chars.into_iter().enumerate() {
+    for unit in units {
+        let ch = type3_base(unit)?;
         // The chosen face first, then the faces after it (Hebrew text takes a character the Hebrew
         // face lacks from the next face that has it); a character no face draws is reported once.
         let mut drawn = type3_glyph(face, ch)?;
@@ -395,11 +416,9 @@ pub(super) fn type3_font(
             drawn = type3_glyph(f, ch)?;
         }
         let Some((path, width)) = drawn else { return Err(no_glyph_for(face, ch)) };
-        let code = u8::try_from((i % per_font).saturating_add(1))
-            .map_err(|_| EditError::Invalid("replacement text has too many unique characters".into()))?;
-        glyphs.push(Type3Glyph { code, ch, path, width });
+        glyphs.push(Type3Glyph { text: unit.to_owned(), path, width });
     }
-    Ok(write_type3_glyphs(doc, fonts_res, face, hebrew, glyphs, per_font))
+    write_type3_glyphs(doc, fonts_res, face, hebrew, glyphs, per_font)
 }
 
 /// Write already validated outlines; callers can prepare every face before adding any objects.
@@ -410,49 +429,91 @@ pub(crate) fn write_type3_glyphs(
     hebrew: bool,
     glyphs: Vec<Type3Glyph>,
     per_font: usize,
-) -> Type3Fallback {
+) -> Result<Type3Fallback, EditError> {
     let per_font = per_font.clamp(1, MAX_TYPE3_GLYPHS);
-    let mut codes = HashMap::with_capacity(glyphs.len());
-    let mut widths = Vec::with_capacity(glyphs.len());
+    // Plan every font before allocating PDF objects. An alias must stay with its selected base.
+    let mut groups = Vec::new();
+    let mut group = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for glyph in glyphs {
+        let nominal = type3_base(&glyph.text)?.to_string();
+        let mut texts = vec![glyph.text];
+        if texts.first() != Some(&nominal) {
+            texts.push(nominal);
+        }
+        let needed = texts.iter().filter(|text| !seen.contains(*text)).count();
+        if group.len().saturating_add(needed) > per_font {
+            groups.push(std::mem::take(&mut group));
+            seen.clear();
+        }
+        if texts.iter().filter(|text| !seen.contains(*text)).count() > per_font {
+            return Err(EditError::Invalid("the font code budget cannot contain a variation sequence and its nominal alias".into()));
+        }
+        let path = std::rc::Rc::new(glyph.path);
+        for text in texts {
+            if !seen.insert(text.clone()) {
+                continue;
+            }
+            let ordinal = group.len().saturating_add(1);
+            let code = if text == " " { 32 } else { ordinal + usize::from(ordinal >= 32) };
+            let code = u8::try_from(code).map_err(|_| EditError::Invalid("replacement text has too many font codes".into()))?;
+            group.push(EncodedType3Glyph { code, text, path: path.clone(), width: glyph.width });
+        }
+    }
+    if !group.is_empty() {
+        groups.push(group);
+    }
+    let mut codes = HashMap::new();
+    let mut widths = Vec::new();
     let mut names = Vec::new();
-    let mut glyphs = glyphs.into_iter();
-    loop {
-        let group: Vec<Type3Glyph> = glyphs.by_ref().take(per_font).collect();
+    for group in groups {
         if group.is_empty() {
-            break;
+            continue;
         }
         for glyph in &group {
-            codes.insert(glyph.ch, (names.len(), glyph.code));
-            widths.push((glyph.ch, glyph.width));
+            if let std::collections::hash_map::Entry::Vacant(entry) = codes.entry(glyph.text.clone()) {
+                entry.insert((names.len(), glyph.code));
+                widths.push((glyph.text.clone(), glyph.width));
+            }
         }
         names.push(add_type3_font(doc, fonts_res, face, hebrew, group));
     }
-    Type3Fallback { family: face.family, names, widths, codes }
+    Ok(Type3Fallback { family: face.family.to_owned(), names, widths, codes })
 }
 
-/// Adds one generated font whose codes 1 to `glyphs.len()` show `glyphs`, and returns its resource
+/// Adds one generated font with explicit sparse codes and returns its resource
 /// name (`PCLat`, `PCJp`, then `PCJp1`, ...; `PCHe`, ... for Hebrew text). Nothing here can fail: the
 /// outlines were read already.
-pub(super) fn add_type3_font(doc: &mut Document, fonts_res: &mut Dict, face: &CraftFont, hebrew: bool, glyphs: Vec<Type3Glyph>) -> String {
-    let last_char = glyphs.len();
+fn add_type3_font(doc: &mut Document, fonts_res: &mut Dict, face: &CraftFont, hebrew: bool, glyphs: Vec<EncodedType3Glyph>) -> String {
+    let last_char = glyphs.iter().map(|glyph| glyph.code).max().unwrap_or(1);
     let mut charprocs = Dict::new();
-    let mut widths = Vec::with_capacity(last_char);
-    let mut differences = vec![Object::Int(1)];
+    let mut widths = vec![Object::Int(0); usize::from(last_char)];
+    // Remove the inherited StandardEncoding space when this font has no real space glyph.
+    let mut differences = vec![Object::Int(32), Object::name(".notdef")];
+    let mut procs = HashMap::new();
     let mut cmap = String::from(
         "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CMapType 2 def\n1 begincodespacerange\n<01> <FF>\nendcodespacerange\n",
     );
-    cmap.push_str(&format!("{last_char} beginbfchar\n"));
+    let mut entries = Vec::new();
     for glyph in glyphs {
         let glyph_name = format!("g{:02X}", glyph.code);
-        let mut pd = Dict::new();
-        pd.set(b"Length".to_vec(), glyph.path.len() as i64);
-        let proc_ref = doc.add(Object::Stream(Stream::from_raw(pd, glyph.path)));
+        let proc_ref = *procs.entry(glyph.path.clone()).or_insert_with(|| {
+            let mut pd = Dict::new();
+            pd.set(b"Length".to_vec(), glyph.path.len() as i64);
+            doc.add(Object::Stream(Stream::from_raw(pd, glyph.path.as_ref().clone())))
+        });
         charprocs.set(glyph_name.as_bytes().to_vec(), Object::Ref(proc_ref));
+        differences.push(Object::Int(i64::from(glyph.code)));
         differences.push(Object::name(&glyph_name));
-        widths.push(Object::Real((glyph.width * 1000.0).round()));
-        cmap.push_str(&format!("<{:02X}> <{}>\n", glyph.code, unicode_hex(glyph.ch)));
+        if let Some(width) = widths.get_mut(usize::from(glyph.code.saturating_sub(1))) {
+            *width = Object::Real((glyph.width * 1000.0).round());
+        }
+        entries.push(format!("<{:02X}> <{}>\n", glyph.code, unicode_hex(&glyph.text)));
     }
-    cmap.push_str("endbfchar\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
+    for entries in entries.chunks(100) {
+        cmap.push_str(&format!("{} beginbfchar\n{}endbfchar\n", entries.len(), entries.concat()));
+    }
+    cmap.push_str("endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
     let mut cmap_dict = Dict::new();
     cmap_dict.set(b"Length".to_vec(), cmap.len() as i64);
     let cmap_ref = doc.add(Object::Stream(Stream::from_raw(cmap_dict, cmap.into_bytes())));
@@ -493,18 +554,45 @@ pub(super) fn add_type3_font(doc: &mut Document, fonts_res: &mut Dict, face: &Cr
     name
 }
 
-/// The runs that show `text` in the fallback: consecutive characters in one font form one run, so
-/// a font is switched only where the text moves to another font. `None` if a character has no code.
+/// Consecutive Unicode units in one font form one run. `None` if a unit has no code.
 pub(super) fn type3_encode(fallback: &Type3Fallback, text: &str) -> Option<Vec<(String, Vec<u8>)>> {
     let mut runs: Vec<(usize, Vec<u8>)> = Vec::new();
-    for ch in text.chars() {
-        let (font, code) = *fallback.codes.get(&ch)?;
+    for (_, unit) in crate::bidi::variation_units(text) {
+        let (font, code) = *fallback.codes.get(unit)?;
         match runs.last_mut() {
             Some((last, bytes)) if *last == font => bytes.push(code),
             _ => runs.push((font, vec![code])),
         }
     }
     runs.into_iter().map(|(font, bytes)| Some((fallback.names.get(font)?.clone(), bytes))).collect()
+}
+
+/// Reuse codes from all shards of the source fallback face, including their nominal aliases.
+pub(super) fn existing_type3(doc: &Document, fonts: &Dict, source: &str, base_font: &str) -> Option<Type3Fallback> {
+    if !fonts.get(source.as_bytes()).and_then(|font| doc.dict(font)).is_some_and(|font| is_type3_fallback(&font)) {
+        return None;
+    }
+    let mut fallback = Type3Fallback { family: base_font.to_owned(), names: Vec::new(), widths: Vec::new(), codes: HashMap::new() };
+    for (name, resource) in fonts.iter() {
+        let Some(font) = doc.dict(resource).filter(is_type3_fallback) else { continue };
+        let metrics = Metrics::from_dict(doc, &font);
+        if !same_base_font(&metrics.base_font, base_font) {
+            continue;
+        }
+        let index = fallback.names.len();
+        fallback.names.push(String::from_utf8_lossy(name).into_owned());
+        for code in 1..=255u8 {
+            let Some(text) = metrics.text_of(u32::from(code)) else { continue };
+            if metrics.encode(&text).as_deref() != Some(&[code]) {
+                continue;
+            }
+            if let std::collections::hash_map::Entry::Vacant(entry) = fallback.codes.entry(text.into_owned()) {
+                fallback.widths.push((entry.key().clone(), metrics.width(u32::from(code))));
+                entry.insert((index, code));
+            }
+        }
+    }
+    Some(fallback)
 }
 
 /// The source font's own TrueType/OpenType program, when the document embeds a complete one whose

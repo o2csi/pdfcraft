@@ -46,10 +46,30 @@ fn is_digit(c: char) -> bool {
 /// Combining marks that ride on the character before them.
 fn is_mark(c: char) -> bool {
     is_hebrew_mark(c)
+        || is_variation_selector(c)
         || matches!(
             u32::from(c),
             0x0300..=0x036F | 0x0610..=0x061A | 0x064B..=0x065F | 0x0670 | 0x06D6..=0x06DC | 0x06DF..=0x06E4 | 0x06E7..=0x06E8 | 0x06EA..=0x06ED | 0xFE20..=0xFE2F
         )
+}
+
+/// BMP variation selectors supported by the nominal-glyph fallback.
+pub(crate) fn is_variation_selector(c: char) -> bool {
+    matches!(c, '\u{FE00}'..='\u{FE0F}')
+}
+
+/// Byte offsets and base characters with all following BMP selectors. This does not shape graphemes.
+pub(crate) fn variation_units(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    let mut chars = text.char_indices().peekable();
+    std::iter::from_fn(move || {
+        let (start, ch) = chars.next()?;
+        let mut end = start.saturating_add(ch.len_utf8());
+        while chars.peek().is_some_and(|(_, ch)| is_variation_selector(*ch)) {
+            let (at, ch) = chars.next()?;
+            end = at.saturating_add(ch.len_utf8());
+        }
+        Some((start, text.get(start..end)?))
+    })
 }
 
 /// Direction marks, embeddings, overrides and isolates: they steer the reordering and are not drawn.
@@ -277,6 +297,12 @@ pub fn to_visual(logical: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn variation_selectors_stay_with_their_base_during_bidi_reordering() {
+        assert_eq!(to_visual("א\u{FE0F}ב"), "בא\u{FE0F}");
+        assert_eq!(to_logical("בא\u{FE0F}"), "א\u{FE0F}ב");
+    }
 
     /// What a producer writes into the content stream for `logical`.
     fn drawn(logical: &str) -> String {

@@ -79,7 +79,7 @@ fn no_end(c: char) -> bool {
 
 /// Whether a row may end between `before` and `after`, neither of them a space.
 pub(crate) fn between(before: char, after: char) -> bool {
-    (ideographic(before) || ideographic(after)) && !no_start(after) && !no_end(before)
+    (ideographic(before) || ideographic(after)) && !crate::bidi::is_variation_selector(after) && !no_start(after) && !no_end(before)
 }
 
 /// `word` (text without spaces) cut where a row may end inside it; the pieces join with nothing.
@@ -94,7 +94,9 @@ pub(crate) fn pieces(word: &str) -> Vec<&str> {
             out.extend(word.get(start..at));
             start = at;
         }
-        prev = Some(c);
+        if !crate::bidi::is_variation_selector(c) {
+            prev = Some(c);
+        }
     }
     out.extend(word.get(start..).filter(|rest| !rest.is_empty()));
     out
@@ -103,6 +105,12 @@ pub(crate) fn pieces(word: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn variation_selectors_do_not_split_from_bases_or_hide_opening_punctuation() {
+        assert_eq!(pieces("字\u{FE0F}字\u{FE0E}字"), ["字\u{FE0F}", "字\u{FE0E}", "字"]);
+        assert_eq!(pieces("（\u{FE0F}字）"), ["（\u{FE0F}字）"]);
+    }
 
     #[test]
     fn ideographs_and_kana_break_between_characters_except_around_kinsoku_marks() {
