@@ -3,9 +3,9 @@ Copyright (c) 2026 ArtCraft Team and the PdfCraft contributors.
 Licensed under the MIT License or the Apache License, Version 2.0, at your option
 (LICENSE-MIT, LICENSE-APACHE).
 
-The ArtCraft name, wordmark and logos in docs/brand/ are trademarks of the ArtCraft Team. They are
-not open source and are not covered by the license above; their terms are in
-docs/brand/LICENSE-brand.txt.
+This independent O2CSI build is based on PdfCraft by the ArtCraft team and contributors.
+The ArtCraft logos and wordmark are not included. Their trademark terms remain recorded in
+docs/brand/LICENSE-brand.txt in the source repository. Original copyrights are retained.
 
 Third-party material
 

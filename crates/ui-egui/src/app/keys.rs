@@ -13,7 +13,6 @@ impl PdfCraftApp {
             let covered = self.pending_link.is_some()
                 || self.pending_remote_link.is_some()
                 || self.pending_full_screen.is_some()
-                || self.updates.open
                 || self.dialog.is_some()
                 || self.unlock_prompt.is_some();
             if !covered && let Some(choice) = dialogs::save_prompt_key(ctx, &mut self.save_prompt_button) {
