@@ -111,9 +111,11 @@ fn remote_document_paths_to_other_computers_and_devices_are_refused() {
 }
 
 #[test]
-fn urls_follow_the_artcraft_scheme() {
-    assert_eq!(super::APP_PAGE, format!("{}/apps/{}", super::WEBSITE, super::APP));
-    assert_eq!(super::GITHUB, format!("https://github.com/storytold/{}", super::APP));
+fn urls_identify_the_o2csi_build_and_the_upstream_community() {
+    assert_eq!(super::APP_PAGE, "https://pdf.craft.o2csi.com");
+    assert_eq!(super::WEBSITE, "https://craft.o2csi.com");
+    assert_eq!(super::GITHUB, format!("https://github.com/o2csi/{}", super::APP));
+    assert_eq!(super::DISCORD, "https://discord.gg/artcraft");
     for l in super::LINKS {
         assert!(l.url.starts_with("https://"), "{}", l.url);
         assert!(crate::commands::command(l.command).is_some(), "{} is a registered command", l.command);

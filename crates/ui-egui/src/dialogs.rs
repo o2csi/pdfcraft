@@ -85,7 +85,6 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
     link_prompt(app, ctx);
     remote_link_prompt(app, ctx);
     full_screen_prompt(app, ctx);
-    crate::updates::dialog(app, ctx);
     if app.dialog != Some(Dialog::WordCount) {
         app.word_count_draft.cancel();
     }
@@ -1511,9 +1510,8 @@ fn dialog_about(ui: &mut egui::Ui, req: &mut Pending) -> bool {
         2 => crate::credits::models_ui(ui),
         _ => {
             ui.horizontal(|ui| {
-                widgets::artcraft_mark(ui, 40.0);
                 ui.vertical(|ui| {
-                    ui.label(egui::RichText::new("PdfCraft").font(theme::semibold(20.0)));
+                    ui.label(egui::RichText::new("PdfCraft O2CSI").font(theme::semibold(20.0)));
                     ui.label(crate::i18n::fmt(tl!("Version {v}"), &[("v", &pdfcraft_engine::build_info::version())]));
                 });
             });
@@ -1527,10 +1525,7 @@ fn dialog_about(ui: &mut egui::Ui, req: &mut Pending) -> bool {
                 .small(),
             );
             ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(tl!("Part of")).color(t.text_muted));
-                widgets::artcraft_logo(ui, 16.0);
-            });
+            ui.label(egui::RichText::new("Independent O2CSI build. Based on PdfCraft by the ArtCraft team.").color(t.text_muted));
             ui.add_space(6.0);
             if let Some(cmd) = widgets::community_links(ui) {
                 req.link_command = Some(cmd);

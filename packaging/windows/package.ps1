@@ -3,7 +3,7 @@
   Build, sign and package PdfCraft for Windows.
 
 .DESCRIPTION
-  Produces, in $env:DIST (default: dist/release):
+  Produces, in $env:DIST (default: dist/release), or only the ZIP with -PortableOnly:
     pdfcraft-<version>-windows-<arch>.msi            per-machine installer (WiX v5)
     pdfcraft-<version>-windows-<arch>-portable.zip   pdfcraft.exe + pdfcraft-cli.exe + models\ + portable.txt
 
@@ -12,10 +12,11 @@
   warning when no signing secrets are set).
 
   Needs: Rust (MSVC toolchain + the target), curl and the network (the OCR models), the Windows SDK (rc.exe, signtool.exe),
-  and WiX v5: dotnet tool install --global wix --version 5.0.2
+  and, unless -PortableOnly is selected, WiX v5: dotnet tool install --global wix --version 5.0.2
 
 .EXAMPLE
   pwsh packaging/windows/package.ps1 -Arch x64
+  pwsh packaging/windows/package.ps1 -Arch x64 -PortableOnly # no MSI or WiX
   pwsh packaging/windows/package.ps1 -Arch x86 -SkipBuild   # set CRAFT_FONTS_DIR, or -BuiltWithoutCraftFonts
   pwsh packaging/windows/package.ps1 -Arch arm64     # cross-compiled; needs the MSVC ARM64 build tools
 #>
@@ -25,7 +26,9 @@ param(
   # -SkipBuild only: the existing binaries were built without CRAFT_FONTS_DIR, so they embed no
   # craft-fonts faces. Without CRAFT_FONTS_DIR this assertion is required: package.ps1 cannot
   # otherwise know whether the binaries need the fonts' OFL notices.
-  [switch] $BuiltWithoutCraftFonts
+  [switch] $BuiltWithoutCraftFonts,
+  # Build the existing portable distribution without creating or registering an MSI.
+  [switch] $PortableOnly
 )
 $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
@@ -140,25 +143,27 @@ if ($env:CRAFT_FONTS_DIR) {
 # ---- end font notices for the MSI --------------------------------------------------------------
 
 # ---- MSI ---------------------------------------------------------------------------------------
-$Msi = Join-Path $Dist "pdfcraft-$Version-windows-$Arch.msi"
-Invoke-Native 'wix build' {
-  wix build (Join-Path $PSScriptRoot 'pdfcraft.wxs') -arch $Arch `
-    (Join-Path $PSScriptRoot 'installer-ui.wxs') `
-    -d "Version=$MsiVersion" -d "BinDir=$Stage" -d "ModelsDir=$Models" -d "IconPath=$(Join-Path $Root 'assets\app-icon\pdfcraft.ico')" `
-    -d "DocsDir=$Docs" -d "HasCraftFontLicences=$HasCraftFontLicences" `
-    -o $Msi
+if (-not $PortableOnly) {
+  $Msi = Join-Path $Dist "pdfcraft-$Version-windows-$Arch.msi"
+  Invoke-Native 'wix build' {
+    wix build (Join-Path $PSScriptRoot 'pdfcraft.wxs') -arch $Arch `
+      (Join-Path $PSScriptRoot 'installer-ui.wxs') `
+      -d "Version=$MsiVersion" -d "BinDir=$Stage" -d "ModelsDir=$Models" -d "IconPath=$(Join-Path $Root 'assets\app-icon\pdfcraft.ico')" `
+      -d "DocsDir=$Docs" -d "HasCraftFontLicences=$HasCraftFontLicences" `
+      -o $Msi
+  }
+  # Inspect the built MSI, not just the XML, before signing/publishing it. In a child process, so
+  # its Windows Installer database handle is gone before signtool opens the MSI.
+  Invoke-Native 'test-msi' {
+    & (Get-Process -Id $PID).Path -NoProfile -File (Join-Path $PSScriptRoot 'test-msi.ps1') $Msi `
+      -CraftFontLicences $HasCraftFontLicences -ExpectedFontNoticesDirectory $Docs
+  }
+  # Check the compiled scope, path and registration contract before signing.
+  & (Join-Path $PSScriptRoot 'check-install-policy.ps1') -MsiPath $Msi
+  # wix writes its debug symbols (.wixpdb) next to the MSI; keep them out of the release assets.
+  Remove-Item -Force -ErrorAction SilentlyContinue ([IO.Path]::ChangeExtension($Msi, '.wixpdb'))
+  & (Join-Path $PSScriptRoot 'sign.ps1') $Msi
 }
-# Inspect the built MSI, not just the XML, before signing/publishing it. In a child process, so
-# its Windows Installer database handle is gone before signtool opens the MSI.
-Invoke-Native 'test-msi' {
-  & (Get-Process -Id $PID).Path -NoProfile -File (Join-Path $PSScriptRoot 'test-msi.ps1') $Msi `
-    -CraftFontLicences $HasCraftFontLicences -ExpectedFontNoticesDirectory $Docs
-}
-# Check the compiled scope, path and registration contract before signing.
-& (Join-Path $PSScriptRoot 'check-install-policy.ps1') -MsiPath $Msi
-# wix writes its debug symbols (.wixpdb) next to the MSI; keep them out of the release assets.
-Remove-Item -Force -ErrorAction SilentlyContinue ([IO.Path]::ChangeExtension($Msi, '.wixpdb'))
-& (Join-Path $PSScriptRoot 'sign.ps1') $Msi
 
 # ---- portable zip ------------------------------------------------------------------------------
 $Portable = Join-Path $TargetDir "windows-package\pdfcraft-$Version-windows-$Arch-portable"
@@ -194,4 +199,8 @@ if ($Arch -ne 'arm64' -or $HostArch -eq 'arm64') {
 } else {
   Write-Output "skipping pdfcraft-cli --version: an $Arch build doesn't run on this $HostArch machine"
 }
-Get-Item $Msi, $Zip | Format-Table Name, Length
+if ($PortableOnly) {
+  Get-Item $Zip | Format-Table Name, Length
+} else {
+  Get-Item $Msi, $Zip | Format-Table Name, Length
+}

@@ -1,43 +1,173 @@
-name: Release
+name: O2CSI web and Windows builds
 
 on:
-  push:
-    branches: [release]
   workflow_dispatch:
     inputs:
       version:
-        description: "Version override for a test run, e.g. 0.2.0-rc.1 (empty: Cargo.toml)"
+        description: "New O2CSI package version (major.minor.patch; never reuse a published version)"
         type: string
-        default: ""
+        required: true
+        default: "0.15.1"
+      draft_release_id:
+        description: "Numeric ID of a manually created draft: tag vVERSION and target equal to this full commit SHA"
+        type: string
+        required: true
 
+# Build artifacts only. Publication and deployment are separate operations.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: o2csi-build-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  PDFCRAFT_VERSION: ${{ inputs.version }}
+  PDFCRAFT_BUILD_LABEL: o2csi.1
+  PDFCRAFT_BUILD_SHA: ${{ github.sha }}
+  PDFCRAFT_DRAFT_RELEASE_ID: ${{ inputs.draft_release_id }}
+  CRAFT_FONTS_REF: b076417b5880bd4154bd22f00695b1d28c6bea83
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+  RUST_BACKTRACE: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
 jobs:
-  release:
-    # Intentionally tracked at @main (not SHA-pinned) so org-wide CI improvements, security fixes, and build optimizations propagate without PR churn across all craftapp repos.
-    uses: storytold/craft-common-actions/.github/workflows/release.yml@main
-    with:
-      app-name: pdfcraft
-      app-title: PdfCraft
-      craft-fonts-ref: b076417b5880bd4154bd22f00695b1d28c6bea83
-      version: ${{ inputs.version }}
-    secrets:
-      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-      AZURE_SIGNING_ENDPOINT: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
-      AZURE_SIGNING_ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
-      AZURE_CERT_PROFILE: ${{ secrets.AZURE_CERT_PROFILE }}
+  web:
+    name: Web archive
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    timeout-minutes: 90
+    env:
+      CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+      CRAFT_FONTS_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check source identity and distribution assets
+        run: |
+          python3 packaging/o2csi_distribution.py identity --platform web --version "$PDFCRAFT_VERSION" --commit "$PDFCRAFT_BUILD_SHA"
+          python3 packaging/o2csi_distribution.py source
+          python3 -m unittest discover -s packaging -p test_o2csi_distribution.py
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: storytold/craft-fonts
+          ref: ${{ env.CRAFT_FONTS_REF }}
+          path: craft-fonts
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: "1.99.1"
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: o2csi-web
+      - name: Install verified Trunk 0.22.1
+        run: |
+          curl --proto '=https' --proto-redir '=https' -fsSL -o "$RUNNER_TEMP/trunk.tar.gz" https://github.com/trunk-rs/trunk/releases/download/v0.22.1/trunk-x86_64-unknown-linux-gnu.tar.gz
+          echo "2ab8d548fd5ed9cda50906f61fd8654204e7893bd52ebbfd90533862b7d71ee1  $RUNNER_TEMP/trunk.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/trunk"
+          tar -xf "$RUNNER_TEMP/trunk.tar.gz" -C "$RUNNER_TEMP/trunk" trunk
+          echo "$RUNNER_TEMP/trunk" >> "$GITHUB_PATH"
+      - name: Install verified Binaryen 133
+        run: |
+          curl --proto '=https' --proto-redir '=https' -fsSL -o "$RUNNER_TEMP/binaryen.tar.gz" https://github.com/WebAssembly/binaryen/releases/download/version_133/binaryen-version_133-x86_64-linux.tar.gz
+          echo "2dc9c7813f5375db93d96ead4b78222fcc3e2677bbb832297af4797782a37489  $RUNNER_TEMP/binaryen.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/binaryen"
+          tar -xf "$RUNNER_TEMP/binaryen.tar.gz" -C "$RUNNER_TEMP/binaryen"
+          echo "$RUNNER_TEMP/binaryen/binaryen-version_133/bin" >> "$GITHUB_PATH"
+      - name: Apply the canonical workspace version transform
+        run: cargo xtask version set "$PDFCRAFT_VERSION"
+      - name: Build the canonical web archive
+        run: |
+          trunk --version
+          wasm-opt --version
+          packaging/web/package.sh
+          python3 packaging/o2csi_distribution.py stamp --platform web --version "$PDFCRAFT_VERSION" --commit "$PDFCRAFT_BUILD_SHA" --archive "dist/release/pdfcraft-web-$PDFCRAFT_VERSION.zip"
+      - name: Upload web archive to the existing draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 packaging/o2csi_distribution.py draft-upload --release-id "$PDFCRAFT_DRAFT_RELEASE_ID" --platform web --version "$PDFCRAFT_VERSION" --commit "$PDFCRAFT_BUILD_SHA" --archive "dist/release/pdfcraft-web-$PDFCRAFT_VERSION.zip"
+
+  windows:
+    name: Windows x64 portable archive
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    timeout-minutes: 90
+    env:
+      CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+      CRAFT_FONTS_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check source identity and distribution assets
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python packaging/o2csi_distribution.py identity --platform windows-x64 --version $env:PDFCRAFT_VERSION --commit $env:PDFCRAFT_BUILD_SHA
+          python packaging/o2csi_distribution.py source
+          python -m unittest discover -s packaging -p test_o2csi_distribution.py
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: storytold/craft-fonts
+          ref: ${{ env.CRAFT_FONTS_REF }}
+          path: craft-fonts
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: "1.99.1"
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: o2csi-windows-x64
+      - name: Apply the canonical workspace version transform
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo xtask version set $env:PDFCRAFT_VERSION
+      - name: Build the canonical portable archive
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          ./packaging/windows/package.ps1 -Arch x64 -PortableOnly
+          if (Get-ChildItem dist/release -Filter *.msi) { throw 'Portable-only build unexpectedly produced an MSI.' }
+          $cli = Join-Path $env:CARGO_TARGET_DIR 'x86_64-pc-windows-msvc/release/pdfcraft-cli.exe'
+          $actualVersion = @(& $cli --version)
+          if ($actualVersion -cnotcontains "pdfcraft-cli $env:PDFCRAFT_VERSION ($env:PDFCRAFT_BUILD_LABEL)") { throw "Unexpected CLI version: $actualVersion" }
+          if ($actualVersion -cnotcontains 'Source:  https://github.com/o2csi/pdfcraft') { throw "Unexpected CLI source: $actualVersion" }
+          python packaging/o2csi_distribution.py stamp --platform windows-x64 --version $env:PDFCRAFT_VERSION --commit $env:PDFCRAFT_BUILD_SHA --archive "dist/release/pdfcraft-$env:PDFCRAFT_VERSION-windows-x64-portable.zip"
+      - name: Upload Windows archive to the existing draft
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python packaging/o2csi_distribution.py draft-upload --release-id $env:PDFCRAFT_DRAFT_RELEASE_ID --platform windows-x64 --version $env:PDFCRAFT_VERSION --commit $env:PDFCRAFT_BUILD_SHA --archive "dist/release/pdfcraft-$env:PDFCRAFT_VERSION-windows-x64-portable.zip"
+
+  validated:
+    name: Validate both archives and checksums
+    needs: [web, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Download both draft archives, verify them and upload checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 packaging/o2csi_distribution.py draft-complete --release-id "$PDFCRAFT_DRAFT_RELEASE_ID" --version "$PDFCRAFT_VERSION" --commit "$PDFCRAFT_BUILD_SHA" --output dist/validated
+          cd dist/validated
+          sha256sum -c SHA256SUMS.txt
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 3
