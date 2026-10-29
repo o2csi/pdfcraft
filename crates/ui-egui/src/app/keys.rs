@@ -1,4 +1,4 @@
-use super::*;
+use super::{PdfCraftApp, QuickTool, canvas, comments, dialogs, object_ui, prepare};
 
 impl PdfCraftApp {
     pub(super) fn shortcuts(&mut self, ctx: &egui::Context) {
