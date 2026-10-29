@@ -45,12 +45,12 @@ use editor::layout_draft;
 pub use editor::{TextEditLayout, TextEditorFont, register_text_font, text_edit_layout, text_editor_fonts};
 #[cfg(test)]
 pub(crate) use fallback::SOURCE_SPACE_CALLS;
+#[cfg(test)]
+use fallback::is_type3_fallback;
 use fallback::{
     MAX_TYPE3_GLYPHS, Type3Glyph, fallback_face, needs_type3, no_fallback_font, no_glyph_for, same_base_font, same_font, source_encodes,
     source_family, source_program, source_show, source_space, source_width, strip_subset_tag, type3_faces, type3_glyph, write_type3_glyphs,
 };
-#[cfg(test)]
-use fallback::{add_type3_font, is_type3_fallback};
 use interp::{Origin, Paint, union};
 use lines::page_dict;
 pub(crate) use lines::{FormBudget, content_streams, content_streams_within, form_call, rewritten_contents, splice};
@@ -260,13 +260,13 @@ mod tests {
     fn hebrew_and_japanese_fallback_shards_are_recognized_as_ours() {
         static HEBR: &[&str] = &["Hebr"];
         let face = CraftFont { family: "FakeHebrew", style: "Regular", scripts: HEBR, bytes: b"" };
-        let glyph = |code, ch| Type3Glyph { code, ch, path: b"0 0 0 0 0 0 d1\nf\n".to_vec(), width: 0.5 };
+        let glyph = |ch: char| Type3Glyph { text: ch.to_string(), path: b"0 0 0 0 0 0 d1\nf\n".to_vec(), width: 0.5 };
         let mut doc = Document::new_empty();
         let mut fonts = Dict::new();
         // A replacement split across two Hebrew fonts, then one Japanese font.
-        let he = add_type3_font(&mut doc, &mut fonts, &face, true, vec![glyph(1, 'א')]);
-        let he1 = add_type3_font(&mut doc, &mut fonts, &face, true, vec![glyph(1, 'ב')]);
-        let jp = add_type3_font(&mut doc, &mut fonts, &face, false, vec![glyph(1, 'あ')]);
+        let he = write_type3_glyphs(&mut doc, &mut fonts, &face, true, vec![glyph('א')], 1).unwrap().names.remove(0);
+        let he1 = write_type3_glyphs(&mut doc, &mut fonts, &face, true, vec![glyph('ב')], 1).unwrap().names.remove(0);
+        let jp = write_type3_glyphs(&mut doc, &mut fonts, &face, false, vec![glyph('あ')], 1).unwrap().names.remove(0);
         assert_eq!([he.as_str(), he1.as_str(), jp.as_str()], ["PCHe", "PCHe1", "PCJp"]);
         for name in [&he, &he1, &jp] {
             let font = fonts.get(name.as_bytes()).and_then(Object::as_dict).cloned().unwrap_or_default();

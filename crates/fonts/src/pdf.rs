@@ -64,6 +64,8 @@ pub struct Metrics {
     code_len: usize,
     /// Valid single-character explicit mappings, preindexed once for large full CJK fonts.
     explicit_reverse: HashMap<char, u32>,
+    /// Effective explicit multi-scalar mappings, longest first for each starting character.
+    explicit_sequences: HashMap<char, Vec<(String, u32)>>,
     /// Subset CIDFontType2 only: one bit per CID (below 65 536) whose glyph has an outline in the
     /// embedded program. See [`cids_with_outlines`].
     outlined_cids: Vec<u64>,
@@ -627,6 +629,7 @@ impl Metrics {
             visual_order: false,
             code_len: 1,
             explicit_reverse: (32..127u8).map(|c| (char::from(c), u32::from(c))).collect(),
+            explicit_sequences: HashMap::new(),
             outlined_cids: Vec::new(),
         }
     }
@@ -669,6 +672,19 @@ impl Metrics {
             }
         }
         m.explicit_reverse = reverse;
+        for (&code, text) in m.unicode.explicit.iter().map(|(code, (_, text))| (code, text)).chain(m.unicode.encoding.iter()) {
+            if only_char(text).is_none()
+                && m.has_glyph(code)
+                && m.unicode.text(code).as_deref() == Some(text.as_str())
+                && let Some(first) = text.chars().next()
+            {
+                m.explicit_sequences.entry(first).or_default().push((text.clone(), code));
+            }
+        }
+        for entries in m.explicit_sequences.values_mut() {
+            entries.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then(a.1.cmp(&b.1)));
+            entries.dedup();
+        }
         // Only a font known to be laid out in visual order counts: a missing GSUB proves nothing
         // (bare CFF and subset fonts often drop it), and the font program is never decoded here.
         if legacy_indic_font(&m.base_font) {
@@ -892,8 +908,8 @@ impl Metrics {
         self.unicode.text(code).is_some_and(|t| t.chars().eq(std::iter::once(c))) && self.has_glyph(code)
     }
 
-    /// The bytes that show `text` in this font, or `None` if some character has no code or
-    /// no glyph in it (the caller then substitutes another font).
+    /// Encode scalars first, retaining their existing codes. If that fails, try effective explicit
+    /// ToUnicode strings longest first. Returns `None` when those mappings cannot encode the text.
     pub fn encode(&self, text: &str) -> Option<Vec<u8>> {
         // The lowest code showing each wanted character. Explicit entries and the encoding are
         // checked one by one; each range is asked for the wanted characters it can show.
@@ -911,11 +927,21 @@ impl Metrics {
                 }
             }
         }
-        let mut out = Vec::with_capacity(text.len() * self.code_len);
-        for ch in text.chars() {
-            let code = *reverse.get(&ch)?;
+        // Keep every previously successful scalar encoding byte-for-byte, including CID selectors.
+        let scalar = wanted.iter().all(|ch| reverse.contains_key(ch));
+        let mut remaining = text;
+        let mut out = Vec::with_capacity(text.len().saturating_mul(self.code_len));
+        while let Some(first) = remaining.chars().next() {
+            let sequence = (!scalar)
+                .then(|| self.explicit_sequences.get(&first).and_then(|entries| entries.iter().find(|(sequence, _)| remaining.starts_with(sequence))))
+                .flatten();
+            let (length, code) = match sequence {
+                Some((sequence, code)) => (sequence.len(), *code),
+                None => (first.len_utf8(), *reverse.get(&first)?),
+            };
             let bytes = code.to_be_bytes();
             out.extend_from_slice(&bytes[4 - self.code_len.clamp(1, 4)..]);
+            remaining = remaining.get(length..)?;
         }
         Some(out)
     }
@@ -1489,6 +1515,40 @@ mod encoding_tests {
         let m = Metrics::from_dict(&doc, &d);
         assert_eq!(m.text_of(0x61).as_deref(), Some("a"));
         assert_eq!(m.decode(b"abc"), "abc");
+    }
+
+    fn sequence_metrics(selector_width: i64, override_sequence: bool) -> Metrics {
+        let mut doc = Document::new_empty();
+        let mut cmap =
+            String::from("1 begincodespacerange <01> <FF> endcodespacerange 3 beginbfchar <01> <0031> <02> <FE0F> <03> <0031FE0F> endbfchar ");
+        if override_sequence {
+            cmap.push_str("1 beginbfrange <03> <03> <0041> endbfrange");
+        }
+        let cmap = doc.add(pdfcraft_cos::Stream::from_raw(Dict::new(), cmap.into_bytes()));
+        let mut font = Dict::new();
+        font.set(b"Subtype".to_vec(), Object::name("TrueType"));
+        font.set(b"BaseFont".to_vec(), Object::name("SyntheticSequence"));
+        font.set(b"FirstChar".to_vec(), Object::Int(1));
+        font.set(b"Widths".to_vec(), Object::Array(vec![Object::Int(500), Object::Int(selector_width), Object::Int(500)]));
+        font.set(b"ToUnicode".to_vec(), Object::Ref(cmap));
+        Metrics::from_dict(&doc, &font)
+    }
+
+    #[test]
+    fn variation_sequence_encoding_preserves_an_existing_successful_scalar_encoding() {
+        let scalar = sequence_metrics(100, false);
+        assert_eq!(scalar.encode("1\u{FE0F}").as_deref(), Some(&[1u8, 2][..]));
+        let sequence = sequence_metrics(0, false);
+        assert_eq!(sequence.encode("1\u{FE0F}").as_deref(), Some(&[3u8][..]));
+        assert_eq!(sequence.encode("1\u{FE0F}1").as_deref(), Some(&[3u8, 1][..]));
+        assert_eq!(sequence.decode(&[3, 1]), "1\u{FE0F}1");
+    }
+
+    #[test]
+    fn variation_sequence_encoding_respects_a_later_cmap_range() {
+        let metrics = sequence_metrics(0, true);
+        assert!(metrics.encode("1\u{FE0F}").is_none());
+        assert_eq!(metrics.encode("A").as_deref(), Some(&[3u8][..]));
     }
 
     #[test]
