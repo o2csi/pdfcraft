@@ -1,7 +1,7 @@
 use super::blocks::{BlockStyle, TextBlock, paragraph_separator, wrap};
 use super::fallback::{
-    Encoder, MAX_TYPE3_GLYPHS, Type3Fallback, drop_unused_fallback_fonts, needs_type3, no_japanese_font, source_encodes, source_family,
-    source_program_completes, source_show, source_space, source_width, type3_encode, type3_font,
+    Encoder, MAX_TYPE3_GLYPHS, Type3Fallback, drop_unused_fallback_fonts, existing_type3, needs_type3, no_japanese_font, source_encodes,
+    source_family, source_program_completes, source_show, source_space, source_width, type3_encode, type3_font,
 };
 use super::interp::{Carry, Origin, TextState, interpret};
 use super::lines::{content_streams, page_dict, rewritten_contents, splice, text_lines};
@@ -42,6 +42,13 @@ fn refuse_clipping_text(lines: &[TextLine], dropped: &std::collections::HashSet<
 
 /// [`replace_line`] with the most unique characters one generated font may hold (tests lower it).
 pub(crate) fn replace_line_with_limit(doc: &mut Document, page: usize, line: usize, text: &str, max_glyphs: usize) -> Result<LineEdit, EditError> {
+    let mut staged = doc.clone();
+    let edit = replace_line_in(&mut staged, page, line, text, max_glyphs)?;
+    *doc = staged;
+    Ok(edit)
+}
+
+fn replace_line_in(doc: &mut Document, page: usize, line: usize, text: &str, max_glyphs: usize) -> Result<LineEdit, EditError> {
     let text = text.replace(['\n', '\r'], " ");
     let lines = text_lines(doc, page)?;
     let target = lines.get(line).cloned().ok_or_else(|| EditError::Invalid(format!("page {} has no line {}", page + 1, line + 1)))?;
@@ -89,8 +96,14 @@ pub(crate) fn replace_line_with_limit(doc: &mut Document, page: usize, line: usi
         )?),
         None => {
             let fallback_shown = crate::bidi::to_visual(&text);
-            if needs_type3(&text) {
-                let fallback = type3_font(doc, &mut fonts_res, &text, source_family(&target.base_font), target.bold, max_glyphs)?;
+            let saved =
+                existing_type3(doc, &fonts_res, &target.font, &target.base_font).filter(|fallback| type3_encode(fallback, &fallback_shown).is_some());
+            if needs_type3(&text) || saved.is_some() {
+                let reusing = saved.is_some();
+                let fallback = match saved {
+                    Some(fallback) => fallback,
+                    None => type3_font(doc, &mut fonts_res, &text, source_family(&target.base_font), target.bold, max_glyphs)?,
+                };
                 let runs = type3_encode(&fallback, &fallback_shown)
                     .ok_or_else(|| EditError::Invalid(format!("\"{text}\" can't be shown by the {} fallback", fallback.family)))?;
                 let size = font_size_before(&ops, first).unwrap_or(target.size);
@@ -99,7 +112,9 @@ pub(crate) fn replace_line_with_limit(doc: &mut Document, page: usize, line: usi
                     replacement.push(Op::new("Tj", vec![Object::String(PdfString::literal(bytes))]));
                 }
                 replacement.push(Op::new("Tf", vec![Object::name(&target.font), pdfcraft_content::num(size)]));
-                substituted = Some(format!("{} Type3", fallback.family));
+                if !reusing {
+                    substituted = Some(format!("{} Type3", fallback.family));
+                }
             } else {
                 let win = pdfcraft_fonts::win_ansi(&fallback_shown);
                 // WinAnsi turns what it can't show into '?'; refuse rather than print the wrong thing.
@@ -359,12 +374,13 @@ impl Advance<'_> {
             }
             (None, Some(fallback)) => {
                 // Each character's count in `s`, from one pass over `s`.
-                let mut counts: HashMap<char, usize> = HashMap::new();
-                for c in s.chars() {
+                let mut counts: HashMap<&str, usize> = HashMap::new();
+                for (_, c) in crate::bidi::variation_units(s) {
                     let count = counts.entry(c).or_insert(0);
                     *count = count.saturating_add(1);
                 }
-                fallback.widths.iter().map(|(ch, width)| counts.get(ch).copied().unwrap_or(0) as f64 * width * self.size).sum::<f64>() + extra
+                fallback.widths.iter().map(|(text, width)| counts.get(text.as_str()).copied().unwrap_or(0) as f64 * width * self.size).sum::<f64>()
+                    + crate::bidi::variation_units(s).count() as f64 * self.char_spacing
             }
             (None, None) => self.family.std14(self.bold, self.italic).text_width(s, self.size) + extra,
         };
@@ -803,7 +819,17 @@ pub(crate) fn rewrite_block_from(
     let right_edge = if anchored_right { (b.rect[2] - b.rect[0]).max(0.0) } else { width };
     let movement = drawn_movement(emit.ctm, dx, dy)?;
     let tm = emit_text_matrix(o, emit)?;
-    let type3 = if !reuse && needs_type3(&flat) { Some(type3_font(doc, &mut fonts_res, &flat, family, bold, max_glyphs)?) } else { None };
+    let saved = if !reuse && style.family.is_none() && style.bold.is_none() {
+        existing_type3(doc, &fonts_res, &font_name, &first.base_font).filter(|fallback| type3_encode(fallback, &flat).is_some())
+    } else {
+        None
+    };
+    let reusing_type3 = saved.is_some();
+    let type3 = match saved {
+        Some(fallback) => Some(fallback),
+        None if !reuse && needs_type3(&flat) => Some(type3_font(doc, &mut fonts_res, &flat, family, bold, max_glyphs)?),
+        None => None,
+    };
     let source_metrics = source.metrics.as_ref().filter(|_| reuse);
     let advance = Advance {
         source: source_metrics,
@@ -825,7 +851,7 @@ pub(crate) fn rewrite_block_from(
     };
     let right_edge = if anchored_right { right_edge } else { width };
     let wrapped = wrap(&text, width + 0.5, |s| advance.of(s));
-    let font = choose_font(
+    let mut font = choose_font(
         &FontInputs {
             source: source_metrics,
             type3: type3.as_ref(),
@@ -839,6 +865,9 @@ pub(crate) fn rewrite_block_from(
         },
         &mut fonts_res,
     )?;
+    if reusing_type3 {
+        font.substituted = None;
+    }
     let lead = line_lead(&b, &lines, style, &LeadScale { k, size, old_size, leading: o_state.leading });
     let start = last.ops.first().copied().unwrap_or(emit.bt_op);
     let split = shows_before_paragraph(&ops, emit.bt_op, start, &dropped);
